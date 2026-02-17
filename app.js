@@ -13,3 +13,14 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+const config = require('./config');
+const { formatDate } = require('./utils');
+
+app.get('/info', (req, res) => {
+  res.json({
+    app: config.appName,
+    env: config.environment,
+    date: formatDate(new Date()),
+  });
+});
