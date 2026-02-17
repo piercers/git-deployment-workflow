@@ -1,9 +1,13 @@
 const config = {
-  appName: 'Deployment Workflow Demo',
+  appName: 'Deployment Workflow Demo v2',
   environment: process.env.NODE_ENV || 'development',
-  logLevel: 'info',
-  maxRetries: 3,
-  timeout: 5000,
+  logLevel: 'debug',
+  maxRetries: 5,
+  timeout: 10000,
+  featureFlags: {
+    darkMode: true,
+    betaApi: false,
+  },
 };
 
 module.exports = config;
