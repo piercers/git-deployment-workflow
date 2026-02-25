@@ -1,0 +1,157 @@
+# Deploy to staging environment when an RC tag is pushed
+#
+# Triggered by: workflow release cut, workflow release rc, workflow hotfix rc
+# Matches tags: rc-YYYY-MM-DD, rc-YYYY-MM-DD-N, rc-YYYY-MM-DD-hotfix-N
+
+name: Deploy Staging
+
+on:
+  push:
+    tags:
+      - "rc-*"
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # OIDC for AWS
+  contents: write   # To update GitHub Release
+  pull-requests: read
+
+jobs:
+  parse-tag:
+    name: Parse Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      date: ${{ steps.meta.outputs.date }}
+      type: ${{ steps.meta.outputs.type }}
+      branch: ${{ steps.meta.outputs.branch }}
+    steps:
+      - name: Extract tag metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Extract date: rc-YYYY-MM-DD[-*]
+          DATE=$(echo "$TAG" | grep -oP 'rc-\K\d{4}-\d{2}-\d{2}')
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$TAG" == *"hotfix"* ]]; then
+            echo "type=hotfix" >> "$GITHUB_OUTPUT"
+            echo "branch=hotfix/${DATE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=release" >> "$GITHUB_OUTPUT"
+            echo "branch=release/${DATE}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staging-build-artifact
+          path: dist/
+          retention-days: 5
+
+  deploy:
+    name: Deploy to Staging
+    needs: [parse-tag, build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: staging-build-artifact
+          path: dist/
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ─── Replace this block with your actual deploy commands ───
+      - name: Deploy to staging environment
+        run: |
+          echo "::notice::Deploying to staging..."
+          echo "Tag:    ${{ needs.parse-tag.outputs.tag }}"
+          echo "Type:   ${{ needs.parse-tag.outputs.type }}"
+          echo "Branch: ${{ needs.parse-tag.outputs.branch }}"
+          # Example: aws ecs update-service --cluster staging --service my-app --force-new-deployment
+          echo "Staging deployment complete (placeholder)"
+      # ──────────────────────────────────────────────────────────
+
+  update-release:
+    name: Update GitHub Release
+    needs: [parse-tag, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add deploy status to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.parse-tag.outputs.tag }}"
+          EXISTING_BODY=$(gh release view "$TAG" --repo "${{ github.repository }}" --json body --jq '.body' 2>/dev/null || echo "")
+          DEPLOY_NOTE=$'\n\n---\n**Staging deploy:** Succeeded\n**Run:** '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --notes "${EXISTING_BODY}${DEPLOY_NOTE}"
+
+  notify:
+    name: Notify
+    needs: [parse-tag, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "emoji=rocket" >> "$GITHUB_OUTPUT"
+            echo "text=Staging deploy succeeded" >> "$GITHUB_OUTPUT"
+            echo "color=#36a64f" >> "$GITHUB_OUTPUT"
+          else
+            echo "emoji=x" >> "$GITHUB_OUTPUT"
+            echo "text=Staging deploy failed" >> "$GITHUB_OUTPUT"
+            echo "color=#dc3545" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":${{ steps.status.outputs.emoji }}: *${{ steps.status.outputs.text }}*\nTag: `${{ needs.parse-tag.outputs.tag }}` (${{ needs.parse-tag.outputs.type }})\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }

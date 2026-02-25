@@ -1,0 +1,325 @@
+# Manual trigger for release lifecycle operations
+#
+# Replaces the local CLI commands:
+#   workflow release cut <date>
+#   workflow release rc <date>
+#   workflow release promote <date>
+#
+# Go to Actions tab -> Release Lifecycle -> Run workflow
+# Pick an action from the dropdown, enter the release date, and click Run.
+#
+# Tags are pushed with GH_PAT so they trigger deploy-staging.yml / deploy-production.yml.
+
+name: Release Lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - cut
+          - rc
+          - promote
+      date:
+        description: "Release date (YYYY-MM-DD)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ───────────────────────────────────────────────────────
+  # release cut — branch from development, tag first RC
+  # ───────────────────────────────────────────────────────
+  cut:
+    name: "Cut Release"
+    if: inputs.action == 'cut'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+          # Verify it's a real date
+          if ! date -d "$DATE" >/dev/null 2>&1; then
+            echo "::error::Invalid date: ${DATE} is not a real calendar date."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: development
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Check branch doesn't already exist
+        run: |
+          BRANCH="release/${{ inputs.date }}"
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "::error::Release branch ${BRANCH} already exists."
+            exit 1
+          fi
+
+      - name: Check tag doesn't already exist
+        run: |
+          TAG="rc-${{ inputs.date }}"
+          git fetch --tags
+          if git tag -l "$TAG" | grep -q "$TAG"; then
+            echo "::error::Tag ${TAG} already exists."
+            exit 1
+          fi
+
+      - name: Create release branch
+        run: |
+          BRANCH="release/${{ inputs.date }}"
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+          echo "::notice::Created branch: ${BRANCH}"
+
+      - name: Create and push RC tag
+        run: |
+          TAG="rc-${{ inputs.date }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Created tag: ${TAG}"
+
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          TAG="rc-${{ inputs.date }}"
+          BRANCH="release/${{ inputs.date }}"
+          gh release create "$TAG" \
+            --title "RC ${{ inputs.date }}" \
+            --prerelease \
+            --generate-notes \
+            --target "$BRANCH"
+
+      - name: Summary
+        run: |
+          echo "## Release Cut Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`release/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`rc-${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Staging deploy will trigger automatically from the RC tag." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#0969da",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":scissors: *Release cut:* `release/${{ inputs.date }}`\nTagged `rc-${{ inputs.date }}` — staging deploy incoming.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+  # ───────────────────────────────────────────────────────
+  # release rc — tag a new release candidate on the release branch
+  # ───────────────────────────────────────────────────────
+  rc:
+    name: "Tag Release Candidate"
+    if: inputs.action == 'rc'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: "release/${{ inputs.date }}"
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Determine next RC number
+        id: next-rc
+        run: |
+          git fetch --tags
+          DATE="${{ inputs.date }}"
+
+          # Count existing RC tags for this date (excluding hotfix RCs)
+          # rc-YYYY-MM-DD is RC 1, rc-YYYY-MM-DD-2 is RC 2, etc.
+          BASE_TAG="rc-${DATE}"
+
+          if ! git tag -l "$BASE_TAG" | grep -q "$BASE_TAG"; then
+            echo "::error::No initial RC tag found (${BASE_TAG}). Run 'cut' first."
+            exit 1
+          fi
+
+          # Find the highest numbered RC
+          HIGHEST=1
+          for tag in $(git tag -l "rc-${DATE}-*" | grep -v "hotfix"); do
+            NUM=$(echo "$tag" | sed "s/rc-${DATE}-//")
+            if [[ "$NUM" =~ ^[0-9]+$ ]] && (( NUM > HIGHEST )); then
+              HIGHEST=$NUM
+            fi
+          done
+
+          NEXT=$((HIGHEST + 1))
+
+          # If no numbered RCs exist yet, next is 2 (since base tag is implicitly 1)
+          if [[ $NEXT -le 1 ]]; then
+            NEXT=2
+          fi
+
+          echo "number=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "tag=rc-${DATE}-${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push RC tag
+        run: |
+          TAG="${{ steps.next-rc.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Created tag: ${TAG}"
+
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          TAG="${{ steps.next-rc.outputs.tag }}"
+          BRANCH="release/${{ inputs.date }}"
+          gh release create "$TAG" \
+            --title "RC ${{ inputs.date }}-${{ steps.next-rc.outputs.number }}" \
+            --prerelease \
+            --generate-notes \
+            --target "$BRANCH"
+
+      - name: Summary
+        run: |
+          echo "## Release Candidate Tagged" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${{ steps.next-rc.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`release/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Staging will redeploy automatically." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#0969da",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":label: *New RC tagged:* `${{ steps.next-rc.outputs.tag }}`\nStaging redeploy incoming.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+  # ───────────────────────────────────────────────────────
+  # release promote — tag for production
+  # ───────────────────────────────────────────────────────
+  promote:
+    name: "Promote to Production"
+    if: inputs.action == 'promote'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: "release/${{ inputs.date }}"
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Check production tag doesn't already exist
+        run: |
+          git fetch --tags
+          TAG="v${{ inputs.date }}"
+          if git tag -l "$TAG" | grep -q "$TAG"; then
+            echo "::error::Production tag ${TAG} already exists. Did you mean to create a hotfix?"
+            exit 1
+          fi
+
+      - name: Create and push production tag
+        run: |
+          TAG="v${{ inputs.date }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Created production tag: ${TAG}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          TAG="v${{ inputs.date }}"
+          BRANCH="release/${{ inputs.date }}"
+          gh release create "$TAG" \
+            --title "v${{ inputs.date }}" \
+            --generate-notes \
+            --target "$BRANCH" \
+            --latest
+
+      - name: Summary
+        run: |
+          echo "## Production Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`v${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`release/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Production deploy will trigger automatically." >> "$GITHUB_STEP_SUMMARY"
+          echo "- A forward-merge PR will be opened into development." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#36a64f",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":rocket: *Production release:* `v${{ inputs.date }}`\nProduction deploy incoming. Forward-merge PR will follow.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }

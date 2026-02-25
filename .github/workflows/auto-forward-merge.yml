@@ -1,0 +1,171 @@
+# Automatically open a forward-merge PR after production deployment
+#
+# Triggered by: repository_dispatch from deploy-production.yml
+# Also supports: manual workflow_dispatch for ad-hoc use
+#
+# This replaces the manual step of running:
+#   workflow release forward-merge <date>
+#   workflow hotfix forward-merge <date>
+
+name: Auto Forward-Merge
+
+on:
+  repository_dispatch:
+    types:
+      - forward-merge
+
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Source branch (e.g., release/2026-02-19 or hotfix/2026-02-19)"
+        required: true
+      tag:
+        description: "Production tag (e.g., v2026-02-19)"
+        required: true
+      type:
+        description: "Type: release or hotfix"
+        required: true
+        default: "release"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  forward-merge:
+    name: Open Forward-Merge PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          # Support both repository_dispatch and workflow_dispatch
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "branch=${{ github.event.client_payload.branch }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.event.client_payload.tag }}" >> "$GITHUB_OUTPUT"
+            echo "type=${{ github.event.client_payload.type }}" >> "$GITHUB_OUTPUT"
+            echo "date=${{ github.event.client_payload.date }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch=${{ github.event.inputs.branch }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "type=${{ github.event.inputs.type }}" >> "$GITHUB_OUTPUT"
+            # Extract date from tag
+            DATE=$(echo "${{ github.event.inputs.tag }}" | grep -oP 'v\K\d{4}-\d{2}-\d{2}')
+            echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if forward-merge PR already exists
+        id: check-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ steps.inputs.outputs.branch }}"
+          EXISTING=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --base development \
+            --state open \
+            --json number,url \
+            --jq '.[0].url // empty')
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "url=${EXISTING}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Forward-merge PR already exists: ${EXISTING}"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if branches have diverged
+        if: steps.check-pr.outputs.exists == 'false'
+        id: diff-check
+        run: |
+          git fetch origin "${{ steps.inputs.outputs.branch }}" development
+          DIFF_COUNT=$(git rev-list --count "origin/development..origin/${{ steps.inputs.outputs.branch }}" 2>/dev/null || echo "0")
+
+          if [[ "$DIFF_COUNT" == "0" ]]; then
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No commits to forward-merge — branches are in sync."
+          else
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Found ${DIFF_COUNT} commit(s) to forward-merge."
+          fi
+
+      - name: Create forward-merge PR
+        if: steps.check-pr.outputs.exists == 'false' && steps.diff-check.outputs.has_diff == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ steps.inputs.outputs.branch }}"
+          TAG="${{ steps.inputs.outputs.tag }}"
+          TYPE="${{ steps.inputs.outputs.type }}"
+
+          PR_URL=$(gh pr create \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --base development \
+            --title "Forward-merge ${BRANCH} into development" \
+            --body "$(cat <<EOF
+          ## Forward-Merge
+
+          Automatically opened after production deploy of \`${TAG}\`.
+
+          This PR merges ${TYPE} branch fixes back into \`development\` to prevent regressions in future releases.
+
+          **Source:** \`${BRANCH}\`
+          **Target:** \`development\`
+          **Production tag:** \`${TAG}\`
+
+          ### Review notes
+          - This PR will **auto-merge** once checks pass (using merge commit)
+          - After merging, the branch will be automatically cleaned up by the auto-cleanup workflow
+
+          ---
+          _Opened automatically by the forward-merge workflow._
+          EOF
+          )" \
+            --label "forward-merge" 2>&1 || true)
+
+          echo "::notice::Forward-merge PR: ${PR_URL}"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_ENV"
+
+      - name: Enable auto-merge
+        if: steps.check-pr.outputs.exists == 'false' && steps.diff-check.outputs.has_diff == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ steps.inputs.outputs.branch }}"
+          # Enable auto-merge with merge commit strategy (not squash) to preserve history
+          gh pr merge \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --auto \
+            --merge || echo "::warning::Could not enable auto-merge. It may need to be enabled in repo settings, or branch protection rules may not be configured."
+
+      - name: Slack notification
+        if: steps.check-pr.outputs.exists == 'false' && steps.diff-check.outputs.has_diff == 'true' && vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#0969da",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":leftwards_arrow_with_hook: *Forward-merge PR opened*\n`${{ steps.inputs.outputs.branch }}` -> `development`\nAfter production deploy of `${{ steps.inputs.outputs.tag }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }

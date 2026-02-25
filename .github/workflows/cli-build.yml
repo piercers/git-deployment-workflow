@@ -1,0 +1,57 @@
+# Build and validate the workflow CLI tool
+#
+# Runs on changes to the CLI source code pushed to development.
+# Ensures TypeScript compiles cleanly and the CLI entry point is valid.
+
+name: CLI Build
+
+on:
+  push:
+    branches:
+      - development
+    paths:
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+
+  pull_request:
+    branches:
+      - development
+    paths:
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build CLI
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Verify CLI entry point
+        run: node dist/cli.js --help
+
+      - name: Verify no uncommitted build artifacts
+        run: |
+          # Ensure dist/ in .gitignore is respected and build output isn't stale
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::warning::Working tree has uncommitted changes after build"
+            git status --short
+          fi

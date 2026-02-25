@@ -1,0 +1,199 @@
+# Deploy to production when a version tag is pushed
+#
+# Triggered by: workflow release promote, workflow hotfix promote
+# Matches tags: vYYYY-MM-DD, vYYYY-MM-DD.N
+#
+# After a successful production deploy, this workflow fires a repository_dispatch
+# event to trigger the auto-forward-merge workflow.
+
+name: Deploy Production
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # Never cancel a production deploy
+
+permissions:
+  id-token: write   # OIDC for AWS
+  contents: write   # To update GitHub Release and dispatch events
+
+jobs:
+  parse-tag:
+    name: Parse Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      date: ${{ steps.meta.outputs.date }}
+      type: ${{ steps.meta.outputs.type }}
+      branch: ${{ steps.meta.outputs.branch }}
+    steps:
+      - name: Extract tag metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Extract date: vYYYY-MM-DD[.N]
+          DATE=$(echo "$TAG" | grep -oP 'v\K\d{4}-\d{2}-\d{2}')
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+          # Determine if this is a hotfix (has patch number: vYYYY-MM-DD.N)
+          if [[ "$TAG" == *"."* ]]; then
+            echo "type=hotfix" >> "$GITHUB_OUTPUT"
+            echo "branch=hotfix/${DATE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=release" >> "$GITHUB_OUTPUT"
+            echo "branch=release/${DATE}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: production-build-artifact
+          path: dist/
+          retention-days: 14
+
+  deploy:
+    name: Deploy to Production
+    needs: [parse-tag, build]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-build-artifact
+          path: dist/
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ─── Replace this block with your actual deploy commands ───
+      - name: Deploy to production environment
+        run: |
+          echo "::notice::Deploying to production..."
+          echo "Tag:    ${{ needs.parse-tag.outputs.tag }}"
+          echo "Type:   ${{ needs.parse-tag.outputs.type }}"
+          echo "Branch: ${{ needs.parse-tag.outputs.branch }}"
+          # Example: aws ecs update-service --cluster production --service my-app --force-new-deployment
+          echo "Production deployment complete (placeholder)"
+      # ──────────────────────────────────────────────────────────
+
+      - name: Health check
+        run: |
+          echo "::notice::Running post-deploy health check..."
+          # Example:
+          #   for i in {1..10}; do
+          #     STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://my-app.example.com/health)
+          #     if [[ "$STATUS" == "200" ]]; then echo "Health check passed"; exit 0; fi
+          #     echo "Attempt $i: status $STATUS, retrying in 10s..."
+          #     sleep 10
+          #   done
+          #   echo "::error::Health check failed after 10 attempts"; exit 1
+          echo "Health check passed (placeholder)"
+
+  update-release:
+    name: Update GitHub Release
+    needs: [parse-tag, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add deploy status to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.parse-tag.outputs.tag }}"
+          EXISTING_BODY=$(gh release view "$TAG" --repo "${{ github.repository }}" --json body --jq '.body' 2>/dev/null || echo "")
+          DEPLOY_NOTE=$'\n\n---\n**Production deploy:** Succeeded\n**Run:** '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --notes "${EXISTING_BODY}${DEPLOY_NOTE}"
+
+  trigger-forward-merge:
+    name: Trigger Forward-Merge
+    needs: [parse-tag, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch forward-merge event
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/dispatches \
+            --method POST \
+            --field event_type=forward-merge \
+            -f "client_payload[tag]=${{ needs.parse-tag.outputs.tag }}" \
+            -f "client_payload[date]=${{ needs.parse-tag.outputs.date }}" \
+            -f "client_payload[type]=${{ needs.parse-tag.outputs.type }}" \
+            -f "client_payload[branch]=${{ needs.parse-tag.outputs.branch }}"
+
+  notify:
+    name: Notify
+    needs: [parse-tag, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "emoji=white_check_mark" >> "$GITHUB_OUTPUT"
+            echo "text=Production deploy succeeded" >> "$GITHUB_OUTPUT"
+            echo "color=#36a64f" >> "$GITHUB_OUTPUT"
+          else
+            echo "emoji=rotating_light" >> "$GITHUB_OUTPUT"
+            echo "text=PRODUCTION DEPLOY FAILED" >> "$GITHUB_OUTPUT"
+            echo "color=#dc3545" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":${{ steps.status.outputs.emoji }}: *${{ steps.status.outputs.text }}*\nTag: `${{ needs.parse-tag.outputs.tag }}` (${{ needs.parse-tag.outputs.type }})\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Comment on GitHub Release
+        if: needs.deploy.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Post a discussion comment or log — GitHub Releases don't have
+            // native comments, so we rely on the release body update above.
+            core.info(`Production deploy of ${context.ref} completed successfully.`);

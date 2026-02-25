@@ -1,0 +1,110 @@
+# Automatically clean up release/hotfix branches after forward-merge
+#
+# Triggered when a forward-merge PR is merged into development.
+# Detects the source branch (release/* or hotfix/*) and deletes it.
+#
+# Replaces the manual step of running:
+#   workflow release cleanup <date>
+#   workflow hotfix cleanup <date>
+
+name: Auto Cleanup
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cleanup:
+    name: Delete Merged Branch
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'development' &&
+      (startsWith(github.event.pull_request.head.ref, 'release/') ||
+       startsWith(github.event.pull_request.head.ref, 'hotfix/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract branch info
+        id: branch
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          echo "name=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$BRANCH" == release/* ]]; then
+            echo "type=release" >> "$GITHUB_OUTPUT"
+          elif [[ "$BRANCH" == hotfix/* ]]; then
+            echo "type=hotfix" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Extract date from branch name
+          DATE=$(echo "$BRANCH" | grep -oP '\d{4}-\d{2}-\d{2}')
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete remote branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ steps.branch.outputs.name }}"
+
+          # Check if the branch still exists before trying to delete
+          if git ls-remote --heads "https://github.com/${{ github.repository }}" "$BRANCH" | grep -q "$BRANCH"; then
+            gh api repos/${{ github.repository }}/git/refs/heads/$BRANCH \
+              --method DELETE
+            echo "::notice::Deleted branch: ${BRANCH}"
+          else
+            echo "::notice::Branch ${BRANCH} already deleted"
+          fi
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ steps.branch.outputs.name }}';
+            const type = '${{ steps.branch.outputs.type }}';
+            const date = '${{ steps.branch.outputs.date }}';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                `### Branch Cleanup Complete`,
+                ``,
+                `Deleted remote branch \`${branch}\` after forward-merge.`,
+                ``,
+                `**Permanent records preserved:**`,
+                type === 'release'
+                  ? `- \`rc-${date}*\` tags — staging deployments\n- \`v${date}\` tag — production deployment`
+                  : `- \`rc-${date}-hotfix-*\` tags — staging validation\n- \`v${date}.*\` tags — production deployments`,
+                ``,
+                `_Cleaned up automatically by the auto-cleanup workflow._`,
+              ].join('\n'),
+            });
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#8b5cf6",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":broom: *Branch cleaned up:* `${{ steps.branch.outputs.name }}`\nForward-merge into `development` complete. Tags preserved as permanent record."
+                      }
+                    }
+                  ]
+                }
+              ]
+            }

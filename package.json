@@ -1,0 +1,21 @@
+{
+  "name": "git-deployment-workflow",
+  "version": "1.0.0",
+  "description": "CLI tool to automate the git deployment workflow",
+  "type": "module",
+  "bin": {
+    "workflow": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

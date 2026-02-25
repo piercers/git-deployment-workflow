@@ -1,0 +1,143 @@
+# Deploy to dev environment on every push to development
+#
+# Replaces manual dev deployments — every squash-merge of a feature PR into
+# development triggers a build and deploy to the dev environment automatically.
+
+name: Deploy Dev
+
+on:
+  push:
+    branches:
+      - development
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # OIDC for AWS
+  contents: read
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+          retention-days: 5
+
+  deploy:
+    name: Deploy to Dev
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist/
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ─── Replace this block with your actual deploy commands ───
+      - name: Deploy to dev environment
+        run: |
+          echo "::notice::Deploying to dev environment..."
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          # Example ECS:
+          #   aws ecs update-service --cluster dev --service my-app --force-new-deployment
+          # Example Lambda:
+          #   aws lambda update-function-code --function-name my-func --zip-file fileb://dist.zip
+          # Example S3 + CloudFront:
+          #   aws s3 sync dist/ s3://my-bucket --delete
+          #   aws cloudfront create-invalidation --distribution-id $CF_DIST_ID --paths "/*"
+          echo "Dev deployment complete (placeholder)"
+      # ──────────────────────────────────────────────────────────
+
+  notify:
+    name: Notify
+    needs: [build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "emoji=white_check_mark" >> "$GITHUB_OUTPUT"
+            echo "text=Dev deploy succeeded" >> "$GITHUB_OUTPUT"
+            echo "color=#36a64f" >> "$GITHUB_OUTPUT"
+          else
+            echo "emoji=x" >> "$GITHUB_OUTPUT"
+            echo "text=Dev deploy failed" >> "$GITHUB_OUTPUT"
+            echo "color=#dc3545" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":${{ steps.status.outputs.emoji }}: *${{ steps.status.outputs.text }}*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run> | `${{ github.sha }}` on `development`"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Comment on merged PR
+        if: needs.deploy.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Find the PR that was just merged (most recent merged PR into development)
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              base: 'development',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 1,
+            });
+            if (prs.length > 0 && prs[0].merged_at) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prs[0].number,
+                body: `Deployed to **dev** environment.\n\nCommit: \`${context.sha}\`\n[View deploy run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              });
+            }

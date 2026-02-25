@@ -1,0 +1,325 @@
+# Manual trigger for hotfix lifecycle operations
+#
+# Replaces the local CLI commands:
+#   workflow hotfix create <date>
+#   workflow hotfix rc <date>
+#   workflow hotfix promote <date>
+#
+# Go to Actions tab -> Hotfix Lifecycle -> Run workflow
+# Pick an action from the dropdown, enter the production tag date, and click Run.
+#
+# Tags are pushed with GH_PAT so they trigger deploy-staging.yml / deploy-production.yml.
+
+name: Hotfix Lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - create
+          - rc
+          - promote
+      date:
+        description: "Production tag date (YYYY-MM-DD)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ───────────────────────────────────────────────────────
+  # hotfix create — branch from latest production tag
+  # ───────────────────────────────────────────────────────
+  create:
+    name: "Create Hotfix Branch"
+    if: inputs.action == 'create'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Check hotfix branch doesn't already exist
+        run: |
+          BRANCH="hotfix/${{ inputs.date }}"
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "::error::Hotfix branch ${BRANCH} already exists."
+            exit 1
+          fi
+
+      - name: Find latest production tag
+        id: find-tag
+        run: |
+          git fetch --tags
+          DATE="${{ inputs.date }}"
+
+          # Collect base tag and patch tags
+          BASE_TAG="v${DATE}"
+          LATEST=""
+
+          # Check for patch tags first (v2026-02-23.1, .2, etc.)
+          HIGHEST_PATCH=0
+          for tag in $(git tag -l "v${DATE}.*"); do
+            PATCH=$(echo "$tag" | sed "s/v${DATE}\.\(.*\)/\1/")
+            if [[ "$PATCH" =~ ^[0-9]+$ ]] && (( PATCH > HIGHEST_PATCH )); then
+              HIGHEST_PATCH=$PATCH
+              LATEST="$tag"
+            fi
+          done
+
+          # Fall back to base tag if no patches exist
+          if [[ -z "$LATEST" ]]; then
+            if git tag -l "$BASE_TAG" | grep -q "$BASE_TAG"; then
+              LATEST="$BASE_TAG"
+            else
+              echo "::error::No production tag found for ${DATE}. Expected v${DATE} or v${DATE}.N"
+              exit 1
+            fi
+          fi
+
+          echo "tag=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Branching from production tag: ${LATEST}"
+
+      - name: Create hotfix branch from tag
+        run: |
+          TAG="${{ steps.find-tag.outputs.tag }}"
+          BRANCH="hotfix/${{ inputs.date }}"
+          git checkout "$TAG"
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+          echo "::notice::Created branch: ${BRANCH} from ${TAG}"
+
+      - name: Summary
+        run: |
+          echo "## Hotfix Branch Created" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`hotfix/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Based on:** \`${{ steps.find-tag.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Next steps:**" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Create a fix branch from \`hotfix/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Open a PR targeting \`hotfix/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Merge the fix, then run this workflow again with action \`rc\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#dc3545",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":rotating_light: *Hotfix branch created:* `hotfix/${{ inputs.date }}`\nBased on `${{ steps.find-tag.outputs.tag }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+  # ───────────────────────────────────────────────────────
+  # hotfix rc — tag a hotfix release candidate for staging
+  # ───────────────────────────────────────────────────────
+  rc:
+    name: "Tag Hotfix RC"
+    if: inputs.action == 'rc'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: "hotfix/${{ inputs.date }}"
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Determine next hotfix RC number
+        id: next-rc
+        run: |
+          git fetch --tags
+          DATE="${{ inputs.date }}"
+
+          # Find the highest existing hotfix RC number
+          HIGHEST=0
+          for tag in $(git tag -l "rc-${DATE}-hotfix-*"); do
+            NUM=$(echo "$tag" | sed "s/rc-${DATE}-hotfix-//")
+            if [[ "$NUM" =~ ^[0-9]+$ ]] && (( NUM > HIGHEST )); then
+              HIGHEST=$NUM
+            fi
+          done
+
+          NEXT=$((HIGHEST + 1))
+          echo "number=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "tag=rc-${DATE}-hotfix-${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push RC tag
+        run: |
+          TAG="${{ steps.next-rc.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Created tag: ${TAG}"
+
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          TAG="${{ steps.next-rc.outputs.tag }}"
+          BRANCH="hotfix/${{ inputs.date }}"
+          gh release create "$TAG" \
+            --title "Hotfix RC ${{ inputs.date }}-${{ steps.next-rc.outputs.number }}" \
+            --prerelease \
+            --generate-notes \
+            --target "$BRANCH"
+
+      - name: Summary
+        run: |
+          echo "## Hotfix RC Tagged" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${{ steps.next-rc.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`hotfix/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Staging will deploy automatically for validation." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#f59e0b",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":label: *Hotfix RC tagged:* `${{ steps.next-rc.outputs.tag }}`\nStaging deploy incoming for validation.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+
+  # ───────────────────────────────────────────────────────
+  # hotfix promote — tag for production
+  # ───────────────────────────────────────────────────────
+  promote:
+    name: "Promote Hotfix to Production"
+    if: inputs.action == 'promote'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate date format
+        run: |
+          DATE="${{ inputs.date }}"
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid date format: ${DATE}. Expected YYYY-MM-DD."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: "hotfix/${{ inputs.date }}"
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Determine next patch number
+        id: next-patch
+        run: |
+          git fetch --tags
+          DATE="${{ inputs.date }}"
+
+          # Find the highest existing patch number
+          HIGHEST=0
+          for tag in $(git tag -l "v${DATE}.*"); do
+            PATCH=$(echo "$tag" | sed "s/v${DATE}\.\(.*\)/\1/")
+            if [[ "$PATCH" =~ ^[0-9]+$ ]] && (( PATCH > HIGHEST )); then
+              HIGHEST=$PATCH
+            fi
+          done
+
+          NEXT=$((HIGHEST + 1))
+          echo "number=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${DATE}.${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push production tag
+        run: |
+          TAG="${{ steps.next-patch.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Created production tag: ${TAG}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          TAG="${{ steps.next-patch.outputs.tag }}"
+          BRANCH="hotfix/${{ inputs.date }}"
+          gh release create "$TAG" \
+            --title "${{ steps.next-patch.outputs.tag }}" \
+            --generate-notes \
+            --target "$BRANCH" \
+            --latest
+
+      - name: Summary
+        run: |
+          echo "## Hotfix Promoted to Production" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${{ steps.next-patch.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`hotfix/${{ inputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Production deploy will trigger automatically." >> "$GITHUB_STEP_SUMMARY"
+          echo "- A forward-merge PR will be opened into development." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: vars.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ vars.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "#36a64f",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": ":rocket: *Hotfix promoted:* `${{ steps.next-patch.outputs.tag }}`\nProduction deploy incoming. Forward-merge PR will follow.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
